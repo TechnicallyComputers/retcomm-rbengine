@@ -47,6 +47,6 @@ When switching MotK off in-tree helpers, map:
 | `netplay_ih_*` / `NetplayInputHist` | `rbe_ih_*` / `RbeInputHist` |
 | `netplay_snap_ring_*` | `rbe_snap_ring_*` (+ vtable save/load) |
 | `netplay_rb_peer_post_tip_ok` | `rbe_rb_peer_post_tip_ok` |
-| `PSX_RB_*` env | `RBE_RB_*` |
+| `PSX_RB_*` env | `RBE_RB_*` (PSX_* still accepted as fallback) |
 
 Keep MotK `psx_netplay_rb_*` episode driver in the PSX runtime.

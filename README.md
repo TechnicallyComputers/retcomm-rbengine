@@ -80,6 +80,9 @@ in the engine. Bind them through `RbeSchedGates` / `RbeSnapVTable`.
 | `RBE_RB_ADAPT_DELAY=0` | Disable pcap-freeze D bumps |
 | `RBE_CROSS_OS_PACING_DIAG=1` | 1 Hz pacing diag line |
 
+MotK-era `PSX_RB_*` / `PSX_NETPLAY_CROSS_OS_PACING_DIAG` names are still
+honoured when the matching `RBE_*` variable is unset.
+
 ## MotK provenance
 
 Lifted from `psxrecomp/runtime` (`psx_netplay_sched`, `netplay_hash_confirm`,

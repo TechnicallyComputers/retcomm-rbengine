@@ -41,6 +41,10 @@ typedef struct RbeSchedGates {
     uint8_t (*media_active)(void *ctx);
     /* Optional: DESYNC invent-hold (MotK §93) — affects stall tag only. */
     uint8_t (*desync_hold)(void *ctx);
+    /* Optional host pre-admit hold (e.g. MotK rematch dig0 CRC gate).
+     * Return 1 to stall; optionally set *tag_out. */
+    uint8_t (*pre_admit_hold)(void *ctx, uint32_t sim, uint32_t wire,
+                              const char **tag_out);
     /* Optional scorecard counters. */
     uint32_t (*episode_count)(void *ctx);
     uint64_t (*replay_ticks_total)(void *ctx);
@@ -57,6 +61,9 @@ typedef struct RbeSchedBridge {
 } RbeSchedBridge;
 
 void rbe_sched_bind(const RbeSchedBridge *bridge);
+
+/* Clear session-scoped pacing/invent state. Called from rbe_sched_bind. */
+void rbe_sched_reset_session(void);
 
 /* sim→wire CONSUMPTION mapping. Default REAL-DELAY: guest tick T plays wire T;
  * local sample at admit(T) stored at T+D. RBE_RB_ZERO_DELAY=1 → legacy T plays
