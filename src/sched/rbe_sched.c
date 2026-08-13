@@ -429,7 +429,7 @@ static uint32_t g_gap1_expire_invent_streak;
  * (non-FMV), scale ½RTT+base, LAN cap 12 / relay cap 20. */
 #define RB_GAP1_LAN_RTT_MAX_MS 48u
 #define RB_GAP1_LAN_GRACE_BASE_MS 4u
-#define RB_GAP1_LAN_GRACE_CAP_MS 12u
+#define RB_GAP1_LAN_GRACE_CAP_MS 20u /* §113: tip mid-flight Win↔UNIX */
 #define RB_GAP1_RELAY_GRACE_CAP_MS 20u
 /* §104: runway (gap≥2) grace — was 8; guest RUNWAY_EMPTY invent was high. */
 #define RB_INVENT_RUNWAY_GRACE_CAP_MS 12u
@@ -756,6 +756,43 @@ static void np_timesync_sample_lead(int remote_lead)
     }
     g_ts_lead_sum += remote_lead;
     g_ts_lead_n++;
+}
+
+/* §113: Win↔UNIX cadence — timesync debt used to arm only on mispredict.
+ * The ahead-of-tip seat (remote_lead < 0) invents GAP1 while the cushioned
+ * peer sits at lead≈+D with debt_ms=0. Pace the ahead seat before invent. */
+static uint32_t g_ts_ahead_streak;
+
+static void np_timesync_note_ahead_skew(int remote_lead)
+{
+    uint32_t add;
+    uint32_t cap;
+
+    np_timesync_check_enabled();
+    if (!g_ts_enabled || sched_media_active() || sched_episode_active() ||
+        sched_tip_holding() || sched_lockstep_no_invent()) {
+        g_ts_ahead_streak = 0u;
+        return;
+    }
+    /* remote_lead = hr - sim; negative ⇒ we are past confirmed tip. */
+    if (remote_lead >= 0) {
+        g_ts_ahead_streak = 0u;
+        return;
+    }
+    g_ts_ahead_streak++;
+    /* Arm after ~8 admits (~130 ms), then add ~½ tick every 4th admit. */
+    if (g_ts_ahead_streak < 8u || (g_ts_ahead_streak & 3u) != 0u)
+        return;
+    add = g_ts_tick_ema_ms ? (g_ts_tick_ema_ms / 2u) : 8u;
+    if (add < 4u)
+        add = 4u;
+    if (add > 12u)
+        add = 12u;
+    cap = g_ts_tick_ema_ms ? g_ts_tick_ema_ms * 3u : 50u;
+    g_ts_debt_ms += add;
+    if (g_ts_debt_ms > cap)
+        g_ts_debt_ms = cap;
+    g_ts_debt_added_ms += add;
 }
 
 /* §30: ~1 Hz phase-control soak line. Compare host vs guest:
@@ -1618,6 +1655,7 @@ int rbe_sched_pre_admit(uint32_t sim, uint32_t wire, const RNetSessionStats *st)
 
     now = sched_mono_ms();
     np_timesync_sample_lead(st->remote_lead);
+    np_timesync_note_ahead_skew(st->remote_lead);
     np_admit_log_runway(now, sim, wire, st->highest_remote_wire,
                         st->remote_lead);
     np_phase_ctrl_maybe_log(now, sim, st->remote_lead);
@@ -2035,6 +2073,7 @@ void rbe_sched_reset_session(void)
     g_ts_lead_min = 0;
     g_ts_lead_max = 0;
     g_ts_lead_have = 0;
+    g_ts_ahead_streak = 0u;
     g_ts_last_wire = 0u;
     g_ts_last_wire_ms = 0u;
     g_ts_stall_until = 0u;
