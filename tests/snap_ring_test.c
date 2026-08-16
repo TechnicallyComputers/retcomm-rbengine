@@ -83,6 +83,11 @@ int main(void)
     CHECK(rbe_snap_ring_count(r) == 0u, "clear");
     rbe_snap_ring_destroy(r);
 
+    r = rbe_snap_ring_create(0);
+    CHECK(r != NULL && rbe_snap_ring_depth(r) == RBE_SNAP_RING_DEFAULT_DEPTH,
+          "create(0) uses default depth");
+    rbe_snap_ring_destroy(r);
+
     if (failures) {
         printf("%d failure(s)\n", failures);
         return 1;

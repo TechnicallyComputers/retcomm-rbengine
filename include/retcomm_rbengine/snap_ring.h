@@ -5,7 +5,14 @@
  * Tick-addressable in-memory snapshot ring for rollback.
  *
  * Owns opaque blobs only. Engines serialize via RbeSnapVTable (or call
- * rbe_snap_ring_store with a pre-built blob). Depth defaults to 80.
+ * rbe_snap_ring_store with a pre-built blob).
+ *
+ * Default depth is 40, not a deep tick history:
+ *   - MotK TipHold runway is 24 ticks (P cap 16; coalesced press→release
+ *     can grow an episode toward 24).
+ *   - Live interval snaps are sparse (16); FMV media snaps every 2–4.
+ *     40 = 24 runway + ~16 denser-cadence / follower-lag slots, half the
+ *     old ungrounded 80. Hosts that need more pass an explicit depth.
  */
 
 #include <stddef.h>
@@ -15,7 +22,7 @@
 extern "C" {
 #endif
 
-#define RBE_SNAP_RING_DEFAULT_DEPTH 80u
+#define RBE_SNAP_RING_DEFAULT_DEPTH 40u
 
 typedef struct RbeSnapRing RbeSnapRing;
 
