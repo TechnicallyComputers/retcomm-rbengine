@@ -141,6 +141,16 @@ static uint8_t sched_pre_admit_hold(uint32_t sim, uint32_t wire, const char **ta
 /* §44: sim→wire consumption mapping (real delay)                      */
 /* ------------------------------------------------------------------ */
 
+/* The min-D floor exists because ROLLBACK with an undersized D invent-storms
+ * (§105). Delay-sync has no invent path: its D is pure input latency, so the
+ * floor there just added 3 frames (60 ms at PAL) of control lag to every
+ * lobby that seeded D=2 — including PSX-Link sessions, which run delay-sync
+ * whenever a console seat is empty. */
+static int rbe_sched_rollback_active(void)
+{
+    return (g_sb.rollback && *g_sb.rollback) ? 1 : 0;
+}
+
 int rbe_sched_real_delay_enabled(void)
 {
     static int s_mode = -1;
@@ -184,7 +194,7 @@ void rbe_sched_sync_delay_from_session(void)
      * started D=4 → invent storm → auto-delay ratchet to 7). Floor matches
      * auto-delay lower bound; Force-TURN keeps its higher floor via adapt. */
     if (d >= 2u && d < (rnet_u8)RB_AUTO_DELAY_LOWER_FLOOR &&
-        rbe_sched_real_delay_enabled()) {
+        rbe_sched_rollback_active() && rbe_sched_real_delay_enabled()) {
         static int s_floor_log;
         if (!s_floor_log) {
             fprintf(stderr,

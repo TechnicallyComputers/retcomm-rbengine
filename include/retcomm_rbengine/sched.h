@@ -57,6 +57,9 @@ typedef struct RbeSchedBridge {
     int *input_prediction; /* P cap, ticks */
     int *local_slot;
     int force_turn;        /* 1 = ICE relay-only — auto-delay floor applies */
+    /* Optional: 1 while the session runs ROLLBACK (invent/episodes). The
+     * min-D floor applies only then; delay-sync D is pure input latency. */
+    int *rollback;
     RbeSchedGates gates;
 } RbeSchedBridge;
 
