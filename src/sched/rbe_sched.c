@@ -14,6 +14,8 @@
 
 #include "recomp_net/recomp_net.h"
 
+#include "retcomm_rbengine/rbe_log.h"
+
 /* Prefer RBE_* knobs; fall back to MotK-era PSX_* names during migration. */
 static const char *rbe_env(const char *primary, const char *legacy)
 {
@@ -54,6 +56,85 @@ void rbe_sched_bind(const RbeSchedBridge *bridge)
 static RNetSession *sched_session(void)
 {
     return g_sb.session ? *g_sb.session : NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Session ops routing                                                 */
+/*                                                                      */
+/* Hosts with their own transport bind RbeSchedBridge.sess_ops; unset   */
+/* members fall back to rnet_session_* on *session (no-op when NULL).   */
+/* ------------------------------------------------------------------ */
+
+static int sess_committed_delay(void)
+{
+    RNetSession *s;
+    if (g_sb.sess_ops.committed_delay)
+        return g_sb.sess_ops.committed_delay(g_sb.sess_ops.ctx);
+    s = sched_session();
+    return s ? (int)rnet_session_committed_delay(s) : -1;
+}
+
+static int sess_can_change_delay(void)
+{
+    return (g_sb.sess_ops.request_delay_change != NULL) ||
+           (sched_session() != NULL);
+}
+
+static int sess_request_delay_change(int new_delay)
+{
+    RNetSession *s;
+    if (g_sb.sess_ops.request_delay_change)
+        return g_sb.sess_ops.request_delay_change(g_sb.sess_ops.ctx,
+                                                  new_delay);
+    s = sched_session();
+    return s ? rnet_session_request_delay_change(s, (rnet_u8)new_delay) : 0;
+}
+
+static int sess_has_arrival_age(void)
+{
+    return (g_sb.sess_ops.remote_arrival_age_ms != NULL) ||
+           (sched_session() != NULL);
+}
+
+static uint32_t sess_arrival_age_ms(int slot, uint32_t wire)
+{
+    RNetSession *s;
+    if (g_sb.sess_ops.remote_arrival_age_ms)
+        return g_sb.sess_ops.remote_arrival_age_ms(g_sb.sess_ops.ctx, slot,
+                                                   wire);
+    s = sched_session();
+    return s ? rnet_session_remote_arrival_age_ms(s, slot, wire)
+             : 0xffffffffu;
+}
+
+static int sess_can_peek(void)
+{
+    return (g_sb.sess_ops.peek_remote_input != NULL) ||
+           (sched_session() != NULL);
+}
+
+static int sess_peek_remote_input(int slot, uint32_t tick,
+                                  RNetInputSample *out)
+{
+    RNetSession *s;
+    if (g_sb.sess_ops.peek_remote_input)
+        return g_sb.sess_ops.peek_remote_input(g_sb.sess_ops.ctx, slot, tick,
+                                               out);
+    s = sched_session();
+    return s ? rnet_session_peek_remote_input(s, slot, tick, out) : 0;
+}
+
+static int sess_get_stats(RNetSessionStats *out)
+{
+    RNetSession *s;
+    memset(out, 0, sizeof(*out));
+    if (g_sb.sess_ops.get_stats)
+        return g_sb.sess_ops.get_stats(g_sb.sess_ops.ctx, out);
+    s = sched_session();
+    if (!s)
+        return 0;
+    rnet_session_get_stats(s, out);
+    return 1;
 }
 
 static int sched_delay(void)
@@ -151,23 +232,28 @@ static int rbe_sched_rollback_active(void)
     return (g_sb.rollback && *g_sb.rollback) ? 1 : 0;
 }
 
+/* -1 = resolve from env on first use; rbe_sched_set_real_delay overrides. */
+static int g_real_delay_mode = -1;
+
+void rbe_sched_set_real_delay(int enabled)
+{
+    g_real_delay_mode = enabled ? 1 : 0;
+}
+
 int rbe_sched_real_delay_enabled(void)
 {
-    static int s_mode = -1;
-    if (s_mode < 0) {
+    if (g_real_delay_mode < 0) {
         const char *e = rbe_env("RBE_RB_ZERO_DELAY", "PSX_RB_ZERO_DELAY");
-        s_mode = (e && e[0] && atoi(e) != 0) ? 0 : 1;
-        fprintf(stderr,
-                s_mode
-                    ? "rbe: consumption REAL-DELAY (§44: guest tick T "
-                      "plays wire T; local sample stored at T+D — D is a real "
-                      "cushion; RBE_RB_ZERO_DELAY=1 restores legacy)\n"
-                    : "rbe: consumption ZERO-DELAY (legacy: guest tick "
-                      "T plays wire T+D sampled the same admit — no cushion, "
-                      "permanent pred_depth 1)\n");
-        fflush(stderr);
+        g_real_delay_mode = (e && e[0] && atoi(e) != 0) ? 0 : 1;
+        rbe_logf(g_real_delay_mode
+                     ? "rbe: consumption REAL-DELAY (§44: guest tick T "
+                       "plays wire T; local sample stored at T+D — D is a real "
+                       "cushion; RBE_RB_ZERO_DELAY=1 restores legacy)\n"
+                     : "rbe: consumption ZERO-DELAY (legacy: guest tick "
+                       "T plays wire T+D sampled the same admit — no cushion, "
+                       "permanent pred_depth 1)\n");
     }
-    return s_mode;
+    return g_real_delay_mode;
 }
 
 uint32_t rbe_sched_wire_for_sim(uint32_t sim_tick)
@@ -186,10 +272,10 @@ uint32_t rbe_sched_wire_for_sim(uint32_t sim_tick)
 void rbe_sched_sync_delay_from_session(void)
 {
     rnet_u8 d;
-    RNetSession *s = sched_session();
-    if (!s || !g_sb.input_delay)
+    int di = sess_committed_delay();
+    if (di < 0 || !g_sb.input_delay)
         return;
-    d = rnet_session_committed_delay(s);
+    d = (rnet_u8)di;
     /* §105: rollback never runs undersized D from lobby seed (session-149
      * started D=4 → invent storm → auto-delay ratchet to 7). Floor matches
      * auto-delay lower bound; Force-TURN keeps its higher floor via adapt. */
@@ -197,19 +283,17 @@ void rbe_sched_sync_delay_from_session(void)
         rbe_sched_rollback_active() && rbe_sched_real_delay_enabled()) {
         static int s_floor_log;
         if (!s_floor_log) {
-            fprintf(stderr,
-                    "rbe: delay floor %u → %u (rollback min D; "
-                    "lobby seed was undersized)\n",
-                    (unsigned)d, (unsigned)RB_AUTO_DELAY_LOWER_FLOOR);
-            fflush(stderr);
+            rbe_logf(
+              "rbe: delay floor %u → %u (rollback min D; "
+              "lobby seed was undersized)\n",
+              (unsigned)d, (unsigned)RB_AUTO_DELAY_LOWER_FLOOR);
             s_floor_log = 1;
         }
         d = (rnet_u8)RB_AUTO_DELAY_LOWER_FLOOR;
     }
     if (d >= 2u && (int)d != *g_sb.input_delay) {
-        fprintf(stderr, "rbe: delay committed %d → %u (session)\n",
-                *g_sb.input_delay, (unsigned)d);
-        fflush(stderr);
+        rbe_logf( "rbe: delay committed %d → %u (session)\n",
+          *g_sb.input_delay, (unsigned)d);
         *g_sb.input_delay = (int)d;
     } else if (d >= 2u) {
         *g_sb.input_delay = (int)d;
@@ -325,13 +409,12 @@ static int np_invent_grace_stall_ex(int slot, rnet_u32 wire, uint32_t budget_cap
         s_grace_ms = (e && e[0]) ? atoi(e) : 8;
         if (s_grace_ms < 0) s_grace_ms = 0;
         if (s_grace_ms > 200) s_grace_ms = 200;
-        fprintf(stderr,
-                "rbe: invent grace floor=%d ms (minimum stall before "
-                "hold-last invent; RBE_RB_INVENT_GRACE_MS — actual per-stall "
-                "budget scales up from measured/synth RTT, see 'rb invent "
-                "grace budget' lines; gap=1 uses a short cap, see §23)\n",
-                s_grace_ms);
-        fflush(stderr);
+        rbe_logf(
+          "rbe: invent grace floor=%d ms (minimum stall before "
+          "hold-last invent; RBE_RB_INVENT_GRACE_MS — actual per-stall "
+          "budget scales up from measured/synth RTT, see 'rb invent "
+          "grace budget' lines; gap=1 uses a short cap, see §23)\n",
+          s_grace_ms);
     }
     if (s_grace_ms == 0 || budget_cap == 0u || slot < 0 || slot >= RBE_SCHED_MAX_SLOTS)
         return 0;
@@ -390,13 +473,12 @@ static int np_invent_grace_stall_ex(int slot, rnet_u32 wire, uint32_t budget_cap
         budget = budget_cap;
     if (!s_budget_logged[slot]) {
         s_budget_logged[slot] = 1;
-        fprintf(stderr,
-                "rbe: invent grace budget=%u ms (floor=%d rtt=%u "
-                "rtt_raw=%u tick_ema=%u delay_ms=%u cap=%u) slot=%d wire=%u\n",
-                (unsigned)budget, s_grace_ms, (unsigned)rtt, (unsigned)rtt_raw,
-                (unsigned)s_tick_ema_ms, (unsigned)delay_ms,
-                (unsigned)budget_cap, slot, (unsigned)wire);
-        fflush(stderr);
+        rbe_logf(
+          "rbe: invent grace budget=%u ms (floor=%d rtt=%u "
+          "rtt_raw=%u tick_ema=%u delay_ms=%u cap=%u) slot=%d wire=%u\n",
+          (unsigned)budget, s_grace_ms, (unsigned)rtt, (unsigned)rtt_raw,
+          (unsigned)s_tick_ema_ms, (unsigned)delay_ms,
+          (unsigned)budget_cap, slot, (unsigned)wire);
     }
     if ((uint32_t)(now - s_t0[slot]) < budget)
         return 1;
@@ -408,11 +490,10 @@ static int np_invent_grace_stall_ex(int slot, rnet_u32 wire, uint32_t budget_cap
              * admit tax before OFF). Hold OFF longer so FMV/menu cutovers
              * don't immediately re-arm a 25ms per-tick stall. */
             s_off_until = now + 5000u;
-            fprintf(stderr,
-                    "rbe: invent grace OFF 5s (remote input "
-                    "consistently later than %u ms)\n",
-                    (unsigned)budget);
-            fflush(stderr);
+            rbe_logf(
+              "rbe: invent grace OFF 5s (remote input "
+              "consistently later than %u ms)\n",
+              (unsigned)budget);
         }
     }
     return 0;
@@ -501,19 +582,17 @@ static uint32_t np_gap1_grace_cap_ms(int *has_override)
             s_cap = atoi(e);
             if (s_cap < 0) s_cap = 0;
             if (s_cap > 40) s_cap = 40;
-            fprintf(stderr,
-                    "rbe: gap1 invent grace cap=%d ms "
-                    "(RBE_RB_GAP1_GRACE_MS override; §28 adaptive split "
-                    "disabled)\n",
-                    s_cap);
-            fflush(stderr);
+            rbe_logf(
+              "rbe: gap1 invent grace cap=%d ms "
+              "(RBE_RB_GAP1_GRACE_MS override; §28 adaptive split "
+              "disabled)\n",
+              s_cap);
         } else {
             s_cap = -1; /* §28: no flat override, adaptive split decides */
-            fprintf(stderr,
-                    "rbe: gap1 invent grace: adaptive §28 split "
-                    "(healthy/advancing tip waits a few ms; stale tip "
-                    "invents now; RBE_RB_GAP1_GRACE_MS forces a flat cap)\n");
-            fflush(stderr);
+            rbe_logf(
+              "rbe: gap1 invent grace: adaptive §28 split "
+              "(healthy/advancing tip waits a few ms; stale tip "
+              "invents now; RBE_RB_GAP1_GRACE_MS forces a flat cap)\n");
         }
     }
     if (has_override)
@@ -553,11 +632,10 @@ static void np_gap1_note_expire_invent(void)
         return;
     g_gap1_expire_invent_streak = 0u;
     g_gap1_shrink_until_ms = now + RB_GAP1_SHRINK_HOLD_MS;
-    fprintf(stderr,
-            "rbe: gap1 invent grace SHRINK %ums for %ums "
-            "(stall expired into invent repeatedly; trusted RTT only)\n",
-            (unsigned)RB_GAP1_SHRINK_CAP_MS, (unsigned)RB_GAP1_SHRINK_HOLD_MS);
-    fflush(stderr);
+    rbe_logf(
+      "rbe: gap1 invent grace SHRINK %ums for %ums "
+      "(stall expired into invent repeatedly; trusted RTT only)\n",
+      (unsigned)RB_GAP1_SHRINK_CAP_MS, (unsigned)RB_GAP1_SHRINK_HOLD_MS);
 }
 
 void rbe_sched_note_remote_hit(void)
@@ -644,11 +722,10 @@ void rbe_sched_arm_absurd_invent_catchup(void)
     g_absurd_catchup_until_ms = now + RB_ABSURD_INVENT_CATCHUP_MS;
     if (g_absurd_catchup_until_ms == 0u)
         g_absurd_catchup_until_ms = 1u;
-    fprintf(stderr,
-            "rbe: absurd invent catchup armed %u ms "
-            "(baseline-abort realign — invent allowed despite absurd lead)\n",
-            (unsigned)RB_ABSURD_INVENT_CATCHUP_MS);
-    fflush(stderr);
+    rbe_logf(
+      "rbe: absurd invent catchup armed %u ms "
+      "(baseline-abort realign — invent allowed despite absurd lead)\n",
+      (unsigned)RB_ABSURD_INVENT_CATCHUP_MS);
 }
 
 static int absurd_invent_catchup_active(uint32_t now)
@@ -724,10 +801,9 @@ static void np_timesync_note_late(uint32_t age)
             g_ts_pegged_streak = 0u;
             g_ts_debt_ms = 0u;
             g_ts_off_until_ms = now + 10000u;
-            fprintf(stderr,
-                    "rbe: timesync OFF 10s (mispredicts keep landing "
-                    "at the pacing cap — transit latency, not phase skew)\n");
-            fflush(stderr);
+            rbe_logf(
+              "rbe: timesync OFF 10s (mispredicts keep landing "
+              "at the pacing cap — transit latency, not phase skew)\n");
             return;
         }
     } else {
@@ -818,26 +894,25 @@ static void np_phase_ctrl_maybe_log(uint32_t now, rnet_u32 sim, int remote_lead)
     s_last = now ? now : 1u;
     lead_avg = g_ts_lead_n ? (int)(g_ts_lead_sum / (int64_t)g_ts_lead_n)
                            : remote_lead;
-    fprintf(stderr,
-            "rbe: phase ctrl slot=%d sim=%u lead=%d lead_avg=%d "
-            "lead_min=%d lead_max=%d debt_ms=%u debt_added=%u "
-            "mispredict=%u mispredict_age_avg=%u mispredict_age_max=%u "
-            "note_late=%u suppressed_rb=%u suppressed_off=%u "
-            "D=%d\n",
-            sched_local_slot(), (unsigned)sim, remote_lead, lead_avg,
-            g_ts_lead_have ? g_ts_lead_min : remote_lead,
-            g_ts_lead_have ? g_ts_lead_max : remote_lead,
-            (unsigned)g_ts_debt_ms, (unsigned)g_ts_debt_added_ms,
-            (unsigned)g_ts_mispredict_count,
-            (unsigned)(g_ts_mispredict_count
-                           ? (g_ts_mispredict_age_sum / g_ts_mispredict_count)
-                           : 0u),
-            (unsigned)g_ts_mispredict_age_max,
-            (unsigned)g_ts_note_late_applied,
-            (unsigned)g_ts_note_late_suppressed_rb,
-            (unsigned)g_ts_note_late_suppressed_off,
-            sched_delay());
-    fflush(stderr);
+    rbe_logf(
+      "rbe: phase ctrl slot=%d sim=%u lead=%d lead_avg=%d "
+      "lead_min=%d lead_max=%d debt_ms=%u debt_added=%u "
+      "mispredict=%u mispredict_age_avg=%u mispredict_age_max=%u "
+      "note_late=%u suppressed_rb=%u suppressed_off=%u "
+      "D=%d\n",
+      sched_local_slot(), (unsigned)sim, remote_lead, lead_avg,
+      g_ts_lead_have ? g_ts_lead_min : remote_lead,
+      g_ts_lead_have ? g_ts_lead_max : remote_lead,
+      (unsigned)g_ts_debt_ms, (unsigned)g_ts_debt_added_ms,
+      (unsigned)g_ts_mispredict_count,
+      (unsigned)(g_ts_mispredict_count
+                     ? (g_ts_mispredict_age_sum / g_ts_mispredict_count)
+                     : 0u),
+      (unsigned)g_ts_mispredict_age_max,
+      (unsigned)g_ts_note_late_applied,
+      (unsigned)g_ts_note_late_suppressed_rb,
+      (unsigned)g_ts_note_late_suppressed_off,
+      sched_delay());
     /* Windowed lead stats reset each second; cumulative counters keep rising. */
     g_ts_lead_sum = 0;
     g_ts_lead_n = 0;
@@ -879,12 +954,11 @@ static int np_timesync_throttle(uint32_t wire)
                 g_ts_stall_logged = 0;
             g_ts_stall_until = now + slice;
             if (!g_ts_stall_logged) {
-                fprintf(stderr,
-                        "rbe: timesync pacing (debt=%u ms tick=%u ms — "
-                        "shaving <=6 ms/tick)\n",
-                        (unsigned)(g_ts_debt_ms + slice),
-                        (unsigned)g_ts_tick_ema_ms);
-                fflush(stderr);
+                rbe_logf(
+                  "rbe: timesync pacing (debt=%u ms tick=%u ms — "
+                  "shaving <=6 ms/tick)\n",
+                  (unsigned)(g_ts_debt_ms + slice),
+                  (unsigned)g_ts_tick_ema_ms);
                 g_ts_stall_logged = 1;
             }
         }
@@ -962,13 +1036,12 @@ static void np_admit_log_invent(rnet_u32 sim, rnet_u32 wire,
         s_burst = 0u;
     }
     s_last_ms = now ? now : 1u;
-    fprintf(stderr,
-            "rbe: invent sim=%u wire=%u remote_tip=%u D=%d "
-            "pred_depth=%u remote_lead=%d reason=%s%s\n",
-            (unsigned)sim, (unsigned)wire, (unsigned)highest_remote, D,
-            (unsigned)pred_depth, remote_lead, reason,
-            s_burst ? " (burst)" : "");
-    fflush(stderr);
+    rbe_logf(
+      "rbe: invent sim=%u wire=%u remote_tip=%u D=%d "
+      "pred_depth=%u remote_lead=%d reason=%s%s\n",
+      (unsigned)sim, (unsigned)wire, (unsigned)highest_remote, D,
+      (unsigned)pred_depth, remote_lead, reason,
+      s_burst ? " (burst)" : "");
 }
 
 static void np_admit_log_runway(uint32_t now, rnet_u32 sim, rnet_u32 wire,
@@ -987,15 +1060,14 @@ static void np_admit_log_runway(uint32_t now, rnet_u32 sim, rnet_u32 wire,
     pred_depth = (wire > highest_remote) ? (wire - highest_remote) : 0u;
     /* How many delay frames of remote tip remain vs live sim. */
     runway_rem = remote_lead; /* highest_remote - sim; §44 healthy ≈ D */
-    fprintf(stderr,
-            "rbe: runway sim=%u wire=%u remote_tip=%u D=%d P=%d "
-            "pred_depth=%u remote_lead=%d runway_rem=%d cushion=%d "
-            "rtt=%u rtt_raw=%u\n",
-            (unsigned)sim, (unsigned)wire, (unsigned)highest_remote, D,
-            g_sb.input_prediction ? *g_sb.input_prediction : 0,
-            (unsigned)pred_depth, remote_lead,
-            runway_rem, g_cushion_rebuild, (unsigned)rtt, (unsigned)rtt_raw);
-    fflush(stderr);
+    rbe_logf(
+      "rbe: runway sim=%u wire=%u remote_tip=%u D=%d P=%d "
+      "pred_depth=%u remote_lead=%d runway_rem=%d cushion=%d "
+      "rtt=%u rtt_raw=%u\n",
+      (unsigned)sim, (unsigned)wire, (unsigned)highest_remote, D,
+      g_sb.input_prediction ? *g_sb.input_prediction : 0,
+      (unsigned)pred_depth, remote_lead,
+      runway_rem, g_cushion_rebuild, (unsigned)rtt, (unsigned)rtt_raw);
     (void)D;
 }
 
@@ -1005,33 +1077,32 @@ static void np_admit_maybe_log_stats(uint32_t now)
         (uint32_t)(now - g_admit_stats_last_log_ms) < 5000u)
         return;
     g_admit_stats_last_log_ms = now ? now : 1u;
-    fprintf(stderr,
-            "rbe: admit stats invent_gap1=%u gap2=%u gap3+=%u "
-            "gap1_grace=%u gap1_case_a=%u gap1_case_b=%u tip_ema=%u "
-            "invent_runway_empty=%u invent_tip_stale=%u "
-            "invent_gap1_legacy=%u cushion_wait=%u "
-            "pcap_stalls=%u pcap_enters=%u freeze=%d D=%d P=%d cushion=%d "
-            "mispredict=%u note_late=%u suppressed_rb=%u suppressed_off=%u "
-            "debt_ms=%u debt_added=%u\n",
-            (unsigned)g_admit_invent_gap1, (unsigned)g_admit_invent_gap2,
-            (unsigned)g_admit_invent_gap3p, (unsigned)g_admit_gap1_grace,
-            (unsigned)g_admit_gap1_case_a, (unsigned)g_admit_gap1_case_b,
-            (unsigned)g_tip_arrival_ema_ms,
-            (unsigned)g_admit_invent_runway_empty,
-            (unsigned)g_admit_invent_tip_stale,
-            (unsigned)g_admit_invent_gap1_legacy,
-            (unsigned)g_admit_cushion_wait,
-            (unsigned)g_admit_pcap_stalls, (unsigned)g_admit_pcap_enters,
-            g_pcap_frozen, sched_delay(),
-            g_sb.input_prediction ? *g_sb.input_prediction : 0,
-            g_cushion_rebuild,
-            (unsigned)g_ts_mispredict_count,
-            (unsigned)g_ts_note_late_applied,
-            (unsigned)g_ts_note_late_suppressed_rb,
-            (unsigned)g_ts_note_late_suppressed_off,
-            (unsigned)g_ts_debt_ms,
-            (unsigned)g_ts_debt_added_ms);
-    fflush(stderr);
+    rbe_logf(
+      "rbe: admit stats invent_gap1=%u gap2=%u gap3+=%u "
+      "gap1_grace=%u gap1_case_a=%u gap1_case_b=%u tip_ema=%u "
+      "invent_runway_empty=%u invent_tip_stale=%u "
+      "invent_gap1_legacy=%u cushion_wait=%u "
+      "pcap_stalls=%u pcap_enters=%u freeze=%d D=%d P=%d cushion=%d "
+      "mispredict=%u note_late=%u suppressed_rb=%u suppressed_off=%u "
+      "debt_ms=%u debt_added=%u\n",
+      (unsigned)g_admit_invent_gap1, (unsigned)g_admit_invent_gap2,
+      (unsigned)g_admit_invent_gap3p, (unsigned)g_admit_gap1_grace,
+      (unsigned)g_admit_gap1_case_a, (unsigned)g_admit_gap1_case_b,
+      (unsigned)g_tip_arrival_ema_ms,
+      (unsigned)g_admit_invent_runway_empty,
+      (unsigned)g_admit_invent_tip_stale,
+      (unsigned)g_admit_invent_gap1_legacy,
+      (unsigned)g_admit_cushion_wait,
+      (unsigned)g_admit_pcap_stalls, (unsigned)g_admit_pcap_enters,
+      g_pcap_frozen, sched_delay(),
+      g_sb.input_prediction ? *g_sb.input_prediction : 0,
+      g_cushion_rebuild,
+      (unsigned)g_ts_mispredict_count,
+      (unsigned)g_ts_note_late_applied,
+      (unsigned)g_ts_note_late_suppressed_rb,
+      (unsigned)g_ts_note_late_suppressed_off,
+      (unsigned)g_ts_debt_ms,
+      (unsigned)g_ts_debt_added_ms);
 }
 
 /* BattleShip-style Win↔Linux cadence triage. RBE_CROSS_OS_PACING_DIAG=1 */
@@ -1080,29 +1151,28 @@ static void np_cross_os_maybe_log(uint32_t now, uint32_t sim,
     s_last_ms = now ? now : 1u;
     stall = rbe_sched_admit_stall_tag();
     tip_age = np_tip_age_ms();
-    fprintf(stderr,
-            "rbe: cross_os_pacing platform=%s slot=%d sim=%u "
-            "hr=%u remote_lead=%d D=%d P=%d tip_ema=%u tip_age=%u "
-            "debt_ms=%u d_debt_added=%u "
-            "d_invent_gap1=%u gap2=%u gap3+=%u grace=%u tip_stale=%u "
-            "runway=%u cushion_wait=%u stall=%s freeze=%d cushion=%d\n",
-            np_cross_os_platform(), sched_local_slot(), (unsigned)sim,
-            (unsigned)st->highest_remote_wire, st->remote_lead, sched_delay(),
-            g_sb.input_prediction ? *g_sb.input_prediction : 0,
-            (unsigned)g_tip_arrival_ema_ms,
-            tip_age == 0xffffffffu ? 0u : (unsigned)tip_age,
-            (unsigned)g_ts_debt_ms,
-            (unsigned)(g_ts_debt_added_ms - s_debt_added_0),
-            (unsigned)(g_admit_invent_gap1 - s_gap1_0),
-            (unsigned)(g_admit_invent_gap2 - s_gap2_0),
-            (unsigned)(g_admit_invent_gap3p - s_gap3_0),
-            (unsigned)(g_admit_gap1_grace - s_grace_0),
-            (unsigned)(g_admit_invent_tip_stale - s_tip_stale_0),
-            (unsigned)(g_admit_invent_runway_empty - s_runway_0),
-            (unsigned)(g_admit_cushion_wait - s_cushion_wait_0),
-            (stall && stall[0]) ? stall : "-", g_pcap_frozen,
-            g_cushion_rebuild);
-    fflush(stderr);
+    rbe_logf(
+      "rbe: cross_os_pacing platform=%s slot=%d sim=%u "
+      "hr=%u remote_lead=%d D=%d P=%d tip_ema=%u tip_age=%u "
+      "debt_ms=%u d_debt_added=%u "
+      "d_invent_gap1=%u gap2=%u gap3+=%u grace=%u tip_stale=%u "
+      "runway=%u cushion_wait=%u stall=%s freeze=%d cushion=%d\n",
+      np_cross_os_platform(), sched_local_slot(), (unsigned)sim,
+      (unsigned)st->highest_remote_wire, st->remote_lead, sched_delay(),
+      g_sb.input_prediction ? *g_sb.input_prediction : 0,
+      (unsigned)g_tip_arrival_ema_ms,
+      tip_age == 0xffffffffu ? 0u : (unsigned)tip_age,
+      (unsigned)g_ts_debt_ms,
+      (unsigned)(g_ts_debt_added_ms - s_debt_added_0),
+      (unsigned)(g_admit_invent_gap1 - s_gap1_0),
+      (unsigned)(g_admit_invent_gap2 - s_gap2_0),
+      (unsigned)(g_admit_invent_gap3p - s_gap3_0),
+      (unsigned)(g_admit_gap1_grace - s_grace_0),
+      (unsigned)(g_admit_invent_tip_stale - s_tip_stale_0),
+      (unsigned)(g_admit_invent_runway_empty - s_runway_0),
+      (unsigned)(g_admit_cushion_wait - s_cushion_wait_0),
+      (stall && stall[0]) ? stall : "-", g_pcap_frozen,
+      g_cushion_rebuild);
     s_gap1_0 = g_admit_invent_gap1;
     s_gap2_0 = g_admit_invent_gap2;
     s_gap3_0 = g_admit_invent_gap3p;
@@ -1191,7 +1261,6 @@ static void np_scorecard_sample(uint32_t now, rnet_u32 sim, rnet_u32 wire,
                                 const RNetSessionStats *st)
 {
     static rnet_u32 s_last_sim = 0xffffffffu;
-    RNetSession *s = sched_session();
 
     if (g_sc_window_t0_ms == 0u)
         np_scorecard_window_reset(now);
@@ -1218,10 +1287,9 @@ static void np_scorecard_sample(uint32_t now, rnet_u32 sim, rnet_u32 wire,
         }
         g_sc_lead_sum += st->remote_lead;
         g_sc_lead_n++;
-        if (s) {
+        if (sess_has_arrival_age()) {
             for (slot = 0; slot < RNET_MAX_SLOTS; ++slot) {
-                uint32_t age =
-                    rnet_session_remote_arrival_age_ms(s, slot, wire);
+                uint32_t age = sess_arrival_age_ms(slot, wire);
                 if (age == 0xffffffffu)
                     continue;
                 if (!g_sc_slack_n) {
@@ -1256,20 +1324,19 @@ static void np_scorecard_sample(uint32_t now, rnet_u32 sim, rnet_u32 wire,
         double depth_avg = d_ep ? (double)d_rt / (double)d_ep : 0.0;
         double slack_avg =
             g_sc_slack_n ? (double)g_sc_slack_sum / (double)g_sc_slack_n : 0.0;
-        fprintf(stderr,
-                "rbe: scorecard dt=%.1fs ep=+%u depth_avg=%.1f "
-                "gap1=+%u tip_stale=+%u miss_need=%u "
-                "lead avg=%.2f min=%d max=%d "
-                "slack avg=%.0fms min=%u max=%u n=%u "
-                "transit_est=%.2f D=%d cushion=%d\n",
-                dt_s, (unsigned)d_ep, depth_avg, (unsigned)d_gap1,
-                (unsigned)d_ts, (unsigned)g_sc_miss_at_need, lead_avg,
-                g_sc_lead_min, g_sc_lead_max, slack_avg,
-                (unsigned)g_sc_slack_min, (unsigned)g_sc_slack_max,
-                (unsigned)g_sc_slack_n,
-                g_transit_have ? (double)g_transit_x16 / 16.0 : -1.0,
-                sched_delay(), g_cushion_rebuild);
-        fflush(stderr);
+        rbe_logf(
+          "rbe: scorecard dt=%.1fs ep=+%u depth_avg=%.1f "
+          "gap1=+%u tip_stale=+%u miss_need=%u "
+          "lead avg=%.2f min=%d max=%d "
+          "slack avg=%.0fms min=%u max=%u n=%u "
+          "transit_est=%.2f D=%d cushion=%d\n",
+          dt_s, (unsigned)d_ep, depth_avg, (unsigned)d_gap1,
+          (unsigned)d_ts, (unsigned)g_sc_miss_at_need, lead_avg,
+          g_sc_lead_min, g_sc_lead_max, slack_avg,
+          (unsigned)g_sc_slack_min, (unsigned)g_sc_slack_max,
+          (unsigned)g_sc_slack_n,
+          g_transit_have ? (double)g_transit_x16 / 16.0 : -1.0,
+          sched_delay(), g_cushion_rebuild);
         np_scorecard_window_reset(now);
     }
 }
@@ -1277,13 +1344,12 @@ static void np_scorecard_sample(uint32_t now, rnet_u32 sim, rnet_u32 wire,
 static void np_adapt_delay_on_pcap_enter(uint32_t now)
 {
     const char *e;
-    RNetSession *s = sched_session();
 
     if (g_adapt_delay_enabled < 0) {
         e = rbe_env("RBE_RB_ADAPT_DELAY", "PSX_RB_ADAPT_DELAY");
         g_adapt_delay_enabled = (e && e[0]) ? (atoi(e) != 0) : 1;
     }
-    if (!g_adapt_delay_enabled || !s)
+    if (!g_adapt_delay_enabled || !sess_can_change_delay())
         return;
     /* Host / sim-authority only — guests receive DELAY_SYNC. */
     if (sched_local_slot() != 0)
@@ -1313,16 +1379,15 @@ static void np_adapt_delay_on_pcap_enter(uint32_t now)
         int new_d = old_d + 1;
         if (new_d > RB_ADAPT_DELAY_MAX)
             new_d = RB_ADAPT_DELAY_MAX;
-        if (rnet_session_request_delay_change(s, (rnet_u8)new_d)) {
+        if (sess_request_delay_change(new_d)) {
             g_adapt_last_bump_ms = now ? now : 1u;
             g_pcap_freeze_enters_window = 0u;
             g_pcap_window_t0_ms = now ? now : 1u;
-            fprintf(stderr,
-                    "rbe: adaptive delay bump %d → %d "
-                    "(pcap freezes in window; P stays %d)\n",
-                    old_d, new_d,
-                    g_sb.input_prediction ? *g_sb.input_prediction : 0);
-            fflush(stderr);
+            rbe_logf(
+              "rbe: adaptive delay bump %d → %d "
+              "(pcap freezes in window; P stays %d)\n",
+              old_d, new_d,
+              g_sb.input_prediction ? *g_sb.input_prediction : 0);
         }
     }
 }
@@ -1335,13 +1400,12 @@ static void np_pcap_freeze_enter(rnet_u32 wire, rnet_u32 highest_remote, int pre
     if (!g_pcap_frozen) {
         g_pcap_frozen = 1;
         g_admit_pcap_enters++;
-        fprintf(stderr,
-                "rbe: pcap FREEZE enter wire=%u remote=%u P=%d "
-                "gap=%u D=%d\n",
-                (unsigned)wire, (unsigned)highest_remote, pred,
-                (unsigned)(wire > highest_remote ? wire - highest_remote : 0u),
-                sched_delay());
-        fflush(stderr);
+        rbe_logf(
+          "rbe: pcap FREEZE enter wire=%u remote=%u P=%d "
+          "gap=%u D=%d\n",
+          (unsigned)wire, (unsigned)highest_remote, pred,
+          (unsigned)(wire > highest_remote ? wire - highest_remote : 0u),
+          sched_delay());
         np_adapt_delay_on_pcap_enter(now);
     }
     np_admit_maybe_log_stats(now);
@@ -1352,11 +1416,10 @@ static void np_pcap_freeze_exit(void)
     if (!g_pcap_frozen)
         return;
     g_pcap_frozen = 0;
-    fprintf(stderr,
-            "rbe: pcap FREEZE exit (remote caught up / invent ok) "
-            "D=%d enters=%u\n",
-            sched_delay(), (unsigned)g_admit_pcap_enters);
-    fflush(stderr);
+    rbe_logf(
+      "rbe: pcap FREEZE exit (remote caught up / invent ok) "
+      "D=%d enters=%u\n",
+      sched_delay(), (unsigned)g_admit_pcap_enters);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1392,7 +1455,6 @@ static void np_auto_delay_tick(uint32_t now)
     static uint32_t s_last_change_ms;
     static uint32_t s_agree_streak;
     static int      s_last_target = -1;
-    RNetSession *s = sched_session();
     uint32_t tick_ms = g_ts_tick_ema_ms ? g_ts_tick_ema_ms : 17u;
     uint32_t ticks, miss, late_n, late_sum, late_max;
     int64_t  lead_sum;
@@ -1406,13 +1468,12 @@ static void np_auto_delay_tick(uint32_t now)
         const char *e = rbe_env("RBE_RB_AUTO_DELAY", "PSX_RB_AUTO_DELAY");
         s_enabled = (e && e[0]) ? (atoi(e) != 0) : 1;
         if (s_enabled)
-            fprintf(stderr,
-                    "rbe: auto delay ON (§57: D provisioned from "
-                    "arrival misses/lateness, host-proposed; "
-                    "RBE_RB_AUTO_DELAY=0 off)\n");
-        fflush(stderr);
+            rbe_logf(
+              "rbe: auto delay ON (§57: D provisioned from "
+              "arrival misses/lateness, host-proposed; "
+              "RBE_RB_AUTO_DELAY=0 off)\n");
     }
-    if (!s_enabled || !s)
+    if (!s_enabled || !sess_can_change_delay())
         return;
     if (!rbe_sched_real_delay_enabled())
         return; /* D is not a latency budget in legacy zero-delay mode */
@@ -1521,20 +1582,19 @@ static void np_auto_delay_tick(uint32_t now)
         (uint32_t)(now - g_pcap_last_enter_ms) < RB_AUTO_DELAY_COOLDOWN_MS)
         return; /* prediction was needed at current D — don't shrink cushion */
 
-    if (rnet_session_request_delay_change(s, (rnet_u8)target)) {
+    if (sess_request_delay_change(target)) {
         s_last_change_ms = now ? now : 1u;
         s_agree_streak = 0u;
-        fprintf(stderr,
-                "rbe: auto delay %d → %d (arrival: miss=%u/%u "
-                "(%u‰) late avg=%ums max=%ums n=%u lead_avg=%.2f "
-                "transit_est=%.2f ticks)\n",
-                d, target, (unsigned)miss, (unsigned)ticks,
-                (unsigned)miss_per_mille,
-                (unsigned)(late_n ? late_sum / late_n : 0u),
-                (unsigned)late_max, (unsigned)late_n,
-                (double)lead_avg_x16 / 16.0,
-                (double)g_transit_x16 / 16.0);
-        fflush(stderr);
+        rbe_logf(
+          "rbe: auto delay %d → %d (arrival: miss=%u/%u "
+          "(%u‰) late avg=%ums max=%ums n=%u lead_avg=%.2f "
+          "transit_est=%.2f ticks)\n",
+          d, target, (unsigned)miss, (unsigned)ticks,
+          (unsigned)miss_per_mille,
+          (unsigned)(late_n ? late_sum / late_n : 0u),
+          (unsigned)late_max, (unsigned)late_n,
+          (double)lead_avg_x16 / 16.0,
+          (double)g_transit_x16 / 16.0);
     }
 }
 
@@ -1568,7 +1628,6 @@ const char *rbe_sched_admit_stall_tag(void)
 static void np_diag_wire_hole(int slot, uint32_t sim, uint32_t wire,
                               const RNetSessionStats *st, const char *stall_why)
 {
-    RNetSession *s = sched_session();
     RNetInputSample sample;
     rnet_u32 tip;
     rnet_u32 t;
@@ -1581,7 +1640,7 @@ static void np_diag_wire_hole(int slot, uint32_t sim, uint32_t wire,
     static rnet_u32 s_last_tip;
     static uint32_t s_last_log_ms;
 
-    if (!st || !s)
+    if (!st || !sess_can_peek())
         return;
     tip = st->highest_remote_wire;
     if (tip <= wire)
@@ -1589,7 +1648,7 @@ static void np_diag_wire_hole(int slot, uint32_t sim, uint32_t wire,
 
     hole_end = wire;
     for (t = wire + 1u; t <= tip; ++t) {
-        if (rnet_session_peek_remote_input(s, slot, t, &sample)) {
+        if (sess_peek_remote_input(slot, t, &sample)) {
             first_present = t;
             have_present = 1;
             break;
@@ -1613,18 +1672,17 @@ static void np_diag_wire_hole(int slot, uint32_t sim, uint32_t wire,
             s_last_need = wire;
             s_last_tip = tip;
             s_last_log_ms = now ? now : 1u;
-            fprintf(stderr,
-                    "rbe: WIRE_HOLE slot=%d sim=%u need=%u tip=%u "
-                    "hole_end=%u hole_span=%u first_present=%d lead=%d "
-                    "red_win_lo≈%u need_in_red_win=%d stall=%s "
-                    "(tip-window retransmit may no longer cover need)\n",
-                    slot, (unsigned)sim, (unsigned)wire, (unsigned)tip,
-                    (unsigned)hole_end,
-                    (unsigned)(hole_end >= wire ? (hole_end - wire + 1u) : 1u),
-                    have_present ? (int)first_present : -1, st->remote_lead,
-                    (unsigned)red_lo, (wire >= red_lo) ? 1 : 0,
-                    stall_why ? stall_why : "?");
-            fflush(stderr);
+            rbe_logf(
+              "rbe: WIRE_HOLE slot=%d sim=%u need=%u tip=%u "
+              "hole_end=%u hole_span=%u first_present=%d lead=%d "
+              "red_win_lo≈%u need_in_red_win=%d stall=%s "
+              "(tip-window retransmit may no longer cover need)\n",
+              slot, (unsigned)sim, (unsigned)wire, (unsigned)tip,
+              (unsigned)hole_end,
+              (unsigned)(hole_end >= wire ? (hole_end - wire + 1u) : 1u),
+              have_present ? (int)first_present : -1, st->remote_lead,
+              (unsigned)red_lo, (wire >= red_lo) ? 1 : 0,
+              stall_why ? stall_why : "?");
         }
     }
     rbe_sched_set_admit_stall("wire_hole");
@@ -1706,10 +1764,9 @@ int rbe_sched_pre_admit(uint32_t sim, uint32_t wire, const RNetSessionStats *st)
         if (st->remote_lead >= full && st->remote_lead <= max_ok) {
             g_cushion_rebuild = 0;
             g_absurd_catchup_until_ms = 0u;
-            fprintf(stderr,
-                    "rbe: cushion rebuilt FULL remote_lead=%d D=%d\n",
-                    st->remote_lead, d);
-            fflush(stderr);
+            rbe_logf(
+              "rbe: cushion rebuilt FULL remote_lead=%d D=%d\n",
+              st->remote_lead, d);
         } else if (st->remote_lead >= achievable && st->remote_lead <= max_ok) {
             uint32_t held = g_cushion_rebuild_since_ms
                                 ? (uint32_t)(now - g_cushion_rebuild_since_ms)
@@ -1717,13 +1774,12 @@ int rbe_sched_pre_admit(uint32_t sim, uint32_t wire, const RNetSessionStats *st)
             if (held >= 400u) {
                 g_cushion_rebuild = 0;
                 g_absurd_catchup_until_ms = 0u;
-                fprintf(stderr,
-                        "rbe: cushion rebuilt ACH remote_lead=%d "
-                        "achievable=%d D=%d transit_est=%.2f held=%ums\n",
-                        st->remote_lead, achievable, d,
-                        g_transit_have ? (double)g_transit_x16 / 16.0 : 0.0,
-                        (unsigned)held);
-                fflush(stderr);
+                rbe_logf(
+                  "rbe: cushion rebuilt ACH remote_lead=%d "
+                  "achievable=%d D=%d transit_est=%.2f held=%ums\n",
+                  st->remote_lead, achievable, d,
+                  g_transit_have ? (double)g_transit_x16 / 16.0 : 0.0,
+                  (unsigned)held);
             }
         } else if (st->remote_lead > max_ok) {
             static uint32_t s_last_absurd_ms;
@@ -1732,20 +1788,18 @@ int rbe_sched_pre_admit(uint32_t sim, uint32_t wire, const RNetSessionStats *st)
                 if (s_last_absurd_ms == 0u ||
                     (uint32_t)(now_a - s_last_absurd_ms) >= 1000u) {
                     s_last_absurd_ms = now_a ? now_a : 1u;
-                    fprintf(stderr,
-                            "rbe: cushion CATCHUP (absurd lead=%d > %d "
-                            "— invent allowed until catchup expires)\n",
-                            st->remote_lead, max_ok);
-                    fflush(stderr);
+                    rbe_logf(
+                      "rbe: cushion CATCHUP (absurd lead=%d > %d "
+                      "— invent allowed until catchup expires)\n",
+                      st->remote_lead, max_ok);
                 }
             } else if (s_last_absurd_ms == 0u ||
                        (uint32_t)(now_a - s_last_absurd_ms) >= 1000u) {
                 s_last_absurd_ms = now_a ? now_a : 1u;
-                fprintf(stderr,
-                        "rbe: cushion KEEP (absurd lead=%d > %d — "
-                        "not a rebuilt cushion; refuse invent)\n",
-                        st->remote_lead, max_ok);
-                fflush(stderr);
+                rbe_logf(
+                  "rbe: cushion KEEP (absurd lead=%d > %d — "
+                  "not a rebuilt cushion; refuse invent)\n",
+                  st->remote_lead, max_ok);
             }
         }
     }
@@ -1799,13 +1853,12 @@ int rbe_sched_on_remote_miss(int slot, uint32_t sim, uint32_t wire,
         if (st->highest_remote_wire <= (rnet_u32)d) {
             if (!g_boot_tip_logged) {
                 g_boot_tip_logged = 1;
-                fprintf(stderr,
-                        "rbe: boot tip wait sim=%u wire=%u "
-                        "remote_tip=%u D=%d (no invent until peer past "
-                        "delay-prefix — rematch dig asymmetry)\n",
-                        (unsigned)sim, (unsigned)wire,
-                        (unsigned)st->highest_remote_wire, d);
-                fflush(stderr);
+                rbe_logf(
+                  "rbe: boot tip wait sim=%u wire=%u "
+                  "remote_tip=%u D=%d (no invent until peer past "
+                  "delay-prefix — rematch dig asymmetry)\n",
+                  (unsigned)sim, (unsigned)wire,
+                  (unsigned)st->highest_remote_wire, d);
             }
             rbe_sched_set_admit_stall("boot_tip_wait");
             if (reason_out)
@@ -1854,12 +1907,11 @@ int rbe_sched_on_remote_miss(int slot, uint32_t sim, uint32_t wire,
             s_gap1_legacy = (atoi(e) != 0) ? 1 : 0;
         else
             s_gap1_legacy = 1;
-        fprintf(stderr,
-                "rbe: gap1 invent %s "
-                "(short grace then invent while remote_lead healthy%s)\n",
-                s_gap1_legacy ? "ON" : "OFF",
-                s_gap1_legacy ? "" : "; RBE_RB_GAP1_INVENT=0");
-        fflush(stderr);
+        rbe_logf(
+          "rbe: gap1 invent %s "
+          "(short grace then invent while remote_lead healthy%s)\n",
+          s_gap1_legacy ? "ON" : "OFF",
+          s_gap1_legacy ? "" : "; RBE_RB_GAP1_INVENT=0");
     }
 
     gap = (wire > st->highest_remote_wire)
@@ -2020,7 +2072,6 @@ int rbe_sched_on_remote_miss(int slot, uint32_t sim, uint32_t wire,
 
 void rbe_sched_post_admit(int any_invent)
 {
-    RNetSession *s;
     RNetSessionStats st;
     uint32_t now;
 
@@ -2030,12 +2081,8 @@ void rbe_sched_post_admit(int any_invent)
     now = sched_mono_ms();
     if (any_invent)
         np_admit_maybe_log_stats(now);
-    s = sched_session();
-    if (s) {
-        memset(&st, 0, sizeof(st));
-        rnet_session_get_stats(s, &st);
+    if (sess_get_stats(&st))
         np_cross_os_maybe_log(now, st.sim_tick, &st);
-    }
 }
 
 void rbe_sched_reset_session(void)

@@ -34,6 +34,7 @@ set(RBE_SOURCES
   src/input/rbe_input_hist.c
   src/snap/rbe_snap_ring.c
   src/sched/rbe_sched.c
+  src/util/rbe_log.c
   src/util/rbe_mono_ms.c
 )
 
@@ -86,6 +87,10 @@ if(RBE_BUILD_TESTS)
   add_executable(sched_smoke_test tests/sched_smoke_test.c)
   target_link_libraries(sched_smoke_test PRIVATE retcomm_rbengine)
   add_test(NAME sched_smoke_test COMMAND sched_smoke_test)
+
+  add_executable(sched_ops_test tests/sched_ops_test.c)
+  target_link_libraries(sched_ops_test PRIVATE retcomm_rbengine)
+  add_test(NAME sched_ops_test COMMAND sched_ops_test)
 endif()
 
 install(TARGETS retcomm_rbengine ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)

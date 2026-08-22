@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include "recomp_net/session.h"
+#include "recomp_net/input.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +51,31 @@ typedef struct RbeSchedGates {
     uint64_t (*replay_ticks_total)(void *ctx);
 } RbeSchedGates;
 
+/*
+ * Optional host session ops. When a member is set it replaces the direct
+ * rnet_session_* call, so hosts that keep their own transport (BattleShip
+ * netpeer, future SNES/NES facades) can bind the scheduler without an
+ * RNetSession. Any NULL member falls back to the rnet_session_* call on
+ * *bridge->session — which itself no-ops when the session is NULL, exactly
+ * as before this seam existed.
+ */
+typedef struct RbeSchedSessionOps {
+    void *ctx;
+    /* Committed wire delay D in ticks; return <0 = unknown (skip sync). */
+    int (*committed_delay)(void *ctx);
+    /* Propose a new committed D (auto/adapt controllers). 1 = accepted.
+     * A shadow-mode host logs the proposal and returns 0 — the controller
+     * keeps re-proposing, which is the observability we want. */
+    int (*request_delay_change)(void *ctx, int new_delay);
+    /* ms since the remote row for (slot, wire) arrived; 0xffffffff = unknown. */
+    uint32_t (*remote_arrival_age_ms)(void *ctx, int slot, uint32_t wire);
+    /* 1 = remote row present at tick for slot (wire-hole diagnostics). */
+    int (*peek_remote_input)(void *ctx, int slot, uint32_t tick,
+                             RNetInputSample *out);
+    /* Fill *out for post-admit cross-OS pacing logs. 1 = filled. */
+    int (*get_stats)(void *ctx, RNetSessionStats *out);
+} RbeSchedSessionOps;
+
 /* Live pointers into host session state (session may repoint on restart). */
 typedef struct RbeSchedBridge {
     RNetSession **session;
@@ -61,6 +87,7 @@ typedef struct RbeSchedBridge {
      * min-D floor applies only then; delay-sync D is pure input latency. */
     int *rollback;
     RbeSchedGates gates;
+    RbeSchedSessionOps sess_ops;
 } RbeSchedBridge;
 
 void rbe_sched_bind(const RbeSchedBridge *bridge);
@@ -73,6 +100,10 @@ void rbe_sched_reset_session(void);
  * wire T+D (no cushion, permanent pred_depth 1). */
 uint32_t rbe_sched_wire_for_sim(uint32_t sim_tick);
 int rbe_sched_real_delay_enabled(void);
+/* Host override for the consumption mapping (1 = REAL-DELAY, 0 = legacy
+ * ZERO-DELAY). Takes precedence over RBE_RB_ZERO_DELAY; callable any time
+ * (a shadow host binds its live mapping before the first admit). */
+void rbe_sched_set_real_delay(int enabled);
 
 void rbe_sched_sync_delay_from_session(void);
 
