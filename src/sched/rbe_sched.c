@@ -1475,7 +1475,7 @@ static void np_auto_delay_tick(uint32_t now)
     }
     if (!s_enabled || !sess_can_change_delay())
         return;
-    if (!rbe_sched_real_delay_enabled())
+    if (!rbe_sched_real_delay_enabled() && !g_sb.auto_delay_in_zero_delay)
         return; /* D is not a latency budget in legacy zero-delay mode */
     if (s_last_eval_ms != 0u && (uint32_t)(now - s_last_eval_ms) < RB_AUTO_DELAY_EVAL_MS)
         return;
