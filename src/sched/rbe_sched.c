@@ -1475,8 +1475,22 @@ static void np_auto_delay_tick(uint32_t now)
     }
     if (!s_enabled || !sess_can_change_delay())
         return;
-    if (!rbe_sched_real_delay_enabled() && !g_sb.auto_delay_in_zero_delay)
-        return; /* D is not a latency budget in legacy zero-delay mode */
+    /*
+     * Do not relax this on the argument that "D still buys the cushion, just spent a
+     * tick earlier". BattleShip tried exactly that (host opt-in, 2026-08-29, reverted):
+     * under wire = sim + D BOTH peers label their inputs sim + D, so raising D raises
+     * the tick you demand and the tick the peer produces by the same amount. Measured
+     * over a 1500-tick soak at D = 4,5,6,7,8: cushion stayed 0.00 at every value while
+     * remote_lead tracked D exactly, prediction pressure got WORSE (0.5% of ticks at
+     * D=4 vs 2.3% at D=8), and the only delivered effect was +4 frames of input lag.
+     * The controller ratcheted straight to the ceiling because the raise bar
+     * (miss>20/1000 && late_n>0) is structurally satisfied under this mapping while the
+     * lower bar (miss<1/1000) is structurally unreachable. D becomes a latency budget
+     * only after the REAL-DELAY flip; until then this early return is the correct
+     * behaviour, not a limitation to work around.
+     */
+    if (!rbe_sched_real_delay_enabled())
+        return;
     if (s_last_eval_ms != 0u && (uint32_t)(now - s_last_eval_ms) < RB_AUTO_DELAY_EVAL_MS)
         return;
     s_last_eval_ms = now ? now : 1u;

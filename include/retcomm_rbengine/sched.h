@@ -86,17 +86,6 @@ typedef struct RbeSchedBridge {
     /* Optional: 1 while the session runs ROLLBACK (invent/episodes). The
      * min-D floor applies only then; delay-sync D is pure input latency. */
     int *rollback;
-    /*
-     * Host opt-in: run the §57 arrival-driven delay controller even under
-     * ZERO-DELAY consumption. Off by default, so MotK/PSX are unaffected.
-     *
-     * The controller normally refuses zero-delay mode because there D is a wire
-     * label offset rather than a latency budget. That is not true of every host:
-     * BattleShip consumes wire = sim + D, where D still buys the cushion, just
-     * spent a tick earlier. Such a host sets this to 1 so arrival misses and
-     * lateness can provision D instead of a static RTT table.
-     */
-    int auto_delay_in_zero_delay;
     RbeSchedGates gates;
     RbeSchedSessionOps sess_ops;
 } RbeSchedBridge;
