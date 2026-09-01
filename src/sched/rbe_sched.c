@@ -860,10 +860,25 @@ static void np_timesync_note_ahead_skew(int remote_lead)
         g_ts_ahead_streak = 0u;
         return;
     }
-    /* remote_lead = hr - sim; negative ⇒ we are past confirmed tip. */
-    if (remote_lead >= 0) {
-        g_ts_ahead_streak = 0u;
-        return;
+    /* remote_lead = hr - sim; negative ⇒ we are past confirmed tip.
+     * §114: pace-to-target — under REAL-DELAY the healthy steady state is
+     * lead ≈ +D (§44); pacing only while lead < 0 parks the boundary peer at
+     * the just-in-time edge where every jitter tick is a gap1. RBE_RB_TS_LEAD_TARGET
+     * (default 0 = legacy) raises the "ahead" threshold so the leading seat keeps
+     * shaving until the follower banks a real margin. */
+    {
+        static int s_lead_target = -1000;
+
+        if (s_lead_target == -1000) {
+            const char *e = rbe_env("RBE_RB_TS_LEAD_TARGET", "PSX_RB_TS_LEAD_TARGET");
+            s_lead_target = (e && e[0]) ? atoi(e) : 0;
+            if (s_lead_target < 0) s_lead_target = 0;
+            if (s_lead_target > 8) s_lead_target = 8;
+        }
+        if (remote_lead >= s_lead_target) {
+            g_ts_ahead_streak = 0u;
+            return;
+        }
     }
     g_ts_ahead_streak++;
     /* Arm after ~8 admits (~130 ms), then add ~½ tick every 4th admit. */
