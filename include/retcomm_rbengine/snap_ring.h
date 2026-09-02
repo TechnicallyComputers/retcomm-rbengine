@@ -13,6 +13,17 @@
  *   - Live interval snaps are sparse (16); FMV media snaps every 2–4.
  *     40 = 24 runway + ~16 denser-cadence / follower-lag slots, half the
  *     old ungrounded 80. Hosts that need more pass an explicit depth.
+ *
+ * DEPTH IS SLOTS, NOT TICKS, and the two differ by the host's snapshot
+ * interval. The derivation above assumes the sparse interval of 16 that MotK
+ * uses, so 40 slots there reach back roughly 640 ticks. A host that snapshots
+ * every tick -- snesrecomp does, its replay being inline and cheap -- gets 40
+ * TICKS from the same 40 slots, about a sixteenth of the reach, and the
+ * arithmetic above does not transfer. It happens to remain sufficient there,
+ * but for a different reason than this comment gives, so measure rather than
+ * inherit: the reach a host needs is peer lag + prediction depth + runway, and
+ * the failure below that is the follower NACKing every episode whose load tick
+ * has aged out.
  */
 
 #include <stddef.h>
